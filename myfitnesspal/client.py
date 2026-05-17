@@ -1404,3 +1404,48 @@ class Client(MFPBase):
             logger.warning("Failed to fetch meals: HTTP %s", result.status_code)
             return []
         return result.json()
+
+    def get_meal(self, meal_id: int, meal_title: str) -> types.Recipe:
+        """Returns meal details as a schema.org Recipe.
+
+        Uses the JSON API (same source as get_meals_detailed) because the
+        update_meal_ingredients page migrated to Next.js and no longer serves
+        usable HTML.
+
+        meal_title is accepted for backward compatibility but ignored; the
+        authoritative name comes from the API response.
+
+        See https://schema.org/Recipe for schema details.
+        """
+        meals = self.get_meals_detailed()
+        meal = next(
+            (m for m in meals if int(m["meal_id"]) == int(meal_id)),
+            None,
+        )
+        if meal is None:
+            raise ValueError(f"Meal {meal_id!r} not found")
+
+        foods = meal.get("foods", [])
+        recipe_dict: dict[str, Any] = {
+            "@context": "https://schema.org",
+            "@type": "Recipe",
+            "author": self.effective_username,
+            "name": meal["description"],
+            "recipeYield": 1,
+            "recipeIngredient": [f["description"] for f in foods],
+            "recipeInstructions": "",
+            "tags": ["MyFitnessPal"],
+        }
+
+        if foods:
+            recipe_dict["nutrition"] = {
+                "@type": "NutritionInformation",
+                "calories": sum(f.get("calories", 0) for f in foods),
+                "carbohydrateContent": sum(f.get("carbs", 0) for f in foods),
+                "fatContent": sum(f.get("fat", 0) for f in foods),
+                "proteinContent": sum(f.get("protein", 0) for f in foods),
+                "sodiumContent": sum(f.get("sodium", 0) for f in foods),
+                "sugarContent": sum(f.get("sugar", 0) for f in foods),
+            }
+
+        return cast(types.Recipe, recipe_dict)
