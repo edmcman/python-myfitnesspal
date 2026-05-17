@@ -40,7 +40,7 @@ class Client(MFPBase):
         "www.myfitnesspal.com",
     ]
     BASE_URL = "http://www.myfitnesspal.com/"
-    BASE_URL_SECURE = "https://www.myfitnesspal.com/"
+    BASE_URL_SECURE = "https://www.myfitnesspal.com"
     BASE_API_URL = "https://api.myfitnesspal.com/"
     LOGIN_FORM_PATH = "account/login"
     LOGIN_JSON_PATH = "api/auth/callback/credentials"
@@ -1671,11 +1671,10 @@ class Client(MFPBase):
     def load_meals(self, meal_index: int) -> list[dict[str, str]]:
         """Fetch all saved meals from /food/load_meals, paginating through results.
 
-        Uses the existing session (which must have valid cookies). Visits
-        add_to_diary first to establish pagination state, then paginates
-        through load_meals.
+        Visits /user/{username}/diary/add first to establish pagination state,
+        then paginates through load_meals to return saved meal groups.
 
-        Returns a list of dicts with keys: food_id, weight_id, name.
+        Returns a list of dicts with keys: food_id, weight_id, name, index.
         """
         import lxml.html
 
@@ -1684,9 +1683,8 @@ class Client(MFPBase):
             self.BASE_URL_SECURE,
             f"food/add_to_diary?meal={meal_index}&date={date_str}",
         )
-        url = parse.urljoin(self.BASE_URL_SECURE, "food/load_meals")
+        load_meals_url = parse.urljoin(self.BASE_URL_SECURE, "food/load_meals")
 
-        # Step 1: Visit add_to_diary to establish pagination state
         resp = self.session.get(add_diary_url)
         add_diary_doc = lxml.html.document_fromstring(resp.text)
         csrf_tokens = add_diary_doc.xpath('//meta[@name="csrf-token"]/@content')
@@ -1695,14 +1693,15 @@ class Client(MFPBase):
         all_meals: list[dict[str, str]] = []
         seen_food_ids: set[str] = set()
         base_index = 0
+        page = 1
 
         while True:
             resp = self.session.post(
-                url,
+                load_meals_url,
                 data={
                     "meal": str(meal_index),
                     "base_index": str(base_index),
-                    "page": "1",
+                    "page": str(page),
                 },
                 headers={
                     "Accept": "text/html, */*; q=0.01",
@@ -1726,8 +1725,17 @@ class Client(MFPBase):
             page_meals: list[dict[str, str]] = []
 
             for row in doc.xpath('//tr[contains(@class,"favorite")]'):
+                cb = row.xpath('.//input[@type="checkbox"]')
+                if not cb:
+                    continue
+                idx = (
+                    cb[0]
+                    .get("name", "")
+                    .replace("favorites[", "")
+                    .replace("][checked]", "")
+                )
                 hidden = row.xpath(
-                    './/input[@type="hidden"][contains(@name,"food_id")]'
+                    f'.//input[@type="hidden"][contains(@name,"favorites[{idx}][food_id]")]'
                 )
                 if not hidden:
                     continue
@@ -1736,7 +1744,7 @@ class Client(MFPBase):
                 name = name_td[0].text_content().strip() if name_td else ""
 
                 weight_id = ""
-                weight_sel = row.xpath('.//select[contains(@name,"weight_id")]')
+                weight_sel = row.xpath(f'.//select[@name="favorites[{idx}][weight_id]"]')
                 if weight_sel:
                     selected = weight_sel[0].xpath(".//option[@selected]/@value")
                     if selected:
@@ -1752,6 +1760,7 @@ class Client(MFPBase):
                             "food_id": food_id,
                             "weight_id": weight_id,
                             "name": name,
+                            "index": idx,
                         }
                     )
 
@@ -1767,16 +1776,17 @@ class Client(MFPBase):
                 break
 
             base_index += len(page_meals)
+            page += 1
 
         return all_meals
 
     def log_saved_meal(
         self, meal_name: str, diary_meal: str, date: datetime.date
     ) -> dict[str, str]:
-        """Log a saved meal to the food diary via the add_favorites endpoint.
+        """Log a saved meal to the food diary via load_meals + add_favorites.
 
         Returns:
-            Dict with keys: food_id, weight_id, name.
+            Dict with keys: food_id, weight_id, name, index.
         """
         import lxml.html
 
@@ -1794,16 +1804,15 @@ class Client(MFPBase):
             self.BASE_URL_SECURE,
             f"food/add_to_diary?meal={meal_index}&date={date_str}",
         )
+
+        # Get authenticity_token for the add_favorites POST (also primes load_meals state)
         resp = self.session.get(add_diary_url)
         doc = lxml.html.document_fromstring(resp.text)
-
-        # Extract authenticity token from the add_favorites form
         form = doc.xpath("//form[contains(@action, 'add_favorites')][1]")
         if not form:
             raise MyfitnesspalRequestFailed(
                 "Could not find add_favorites form on add_to_diary page"
             )
-
         at = form[0].xpath(".//input[@name='authenticity_token']/@value")
         if not at:
             raise MyfitnesspalRequestFailed(
@@ -1811,49 +1820,16 @@ class Client(MFPBase):
             )
         authenticity_token = at[0]
 
-        # Search for the meal by name in the form
-        meal_entry = None
-        for row in form[0].xpath('.//tr[contains(@class,"favorite")]'):
-            cb = row.xpath('.//input[@type="checkbox"]')
-            if not cb:
-                continue
-            idx = (
-                cb[0]
-                .get("name", "")
-                .replace("favorites[", "")
-                .replace("][checked]", "")
-            )
-            hidden = row.xpath(
-                f'.//input[@type="hidden"][contains(@name,"favorites[{idx}][food_id]")]'
-            )
-            if not hidden:
-                continue
-            food_id = hidden[0].get("value", "")
-            name_td = row.xpath(".//td[2]")
-            name = name_td[0].text_content().strip() if name_td else ""
-
-            weight_id = ""
-            weight_sel = row.xpath(f'.//select[@name="favorites[{idx}][weight_id]"]')
-            if weight_sel:
-                selected = weight_sel[0].xpath('.//option[@selected]/@value')
-                weight_id = selected[0] if selected else ""
-
-            if meal_name.lower() in name.lower() or name.lower() in meal_name.lower():
-                meal_entry = {
-                    "food_id": food_id,
-                    "weight_id": weight_id,
-                    "name": name,
-                    "index": idx,
-                }
-                break
+        # Use load_meals to paginate and find the target meal by name
+        all_meals = self.load_meals(meal_index)
+        meal_entry = next(
+            (m for m in all_meals
+             if meal_name.lower() in m["name"].lower() or m["name"].lower() in meal_name.lower()),
+            None,
+        )
 
         if meal_entry is None:
-            available_names = []
-            for row in form[0].xpath('.//tr[contains(@class,"favorite")]')[:10]:
-                name_td = row.xpath(".//td[2]")
-                if name_td:
-                    available_names.append(name_td[0].text_content().strip())
-            available = ", ".join(available_names)
+            available = ", ".join(m["name"] for m in all_meals[:10])
             raise ValueError(
                 f"Meal '{meal_name}' not found. "
                 f"Available meals: {available}"
