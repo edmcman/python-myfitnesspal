@@ -1375,34 +1375,43 @@ class Client(MFPBase):
     def get_meals(self) -> dict[int, str]:
         """Returns a dictionary with all saved meals.
 
-        Key: Meal ID
+        Key: Meal ID (int)
         Value: Meal Name
+
+        Uses the JSON API because the meal/mine page migrated to Next.js and
+        the old XPath-based scraping no longer works.
         """
-        meals_dict = {}
-        meals_path = "meal/mine"
-        meals_url = parse.urljoin(self.BASE_URL_SECURE, meals_path)
-        document = self._get_document_for_url(meals_url)
+        meals_url = parse.urljoin(
+            self.BASE_URL_SECURE, "api/services/users/meals/mine"
+        )
+        result = self._get_request_for_url(meals_url)
+        if not result.ok:
+            logger.warning("Failed to fetch meals: HTTP %s", result.status_code)
+            return {}
+        return {int(meal["meal_id"]): meal["description"] for meal in result.json()}
 
-        meals = document.xpath(
-            "//*[@id='matching']/li"
-        )  # get all items in the recipe list
-        _idx: int | None = None
-        try:
-            for _idx, meal in enumerate(meals):
-                meal_path = meal.xpath("./a")[0].attrib["href"]
-                meal_id = meal_path.split("/")[-1].split("?")[0]
-                meal_title = meal.xpath("./a")[0].text
-                meals_dict[meal_id] = meal_title
-        except Exception:
-            # no meals available?
-            logger.warning(f"Could not extract meal at index {_idx}")
+    def get_meals_detailed(self) -> list[dict[str, Any]]:
+        """Returns full meal data from the JSON API, including ingredient lists.
 
-        return meals_dict
+        Each element has keys: meal_id (int), description (str), foods (list).
+        Each food has: description, calories, carbs, fat, protein, sodium, sugar.
+        """
+        meals_url = parse.urljoin(
+            self.BASE_URL_SECURE, "api/services/users/meals/mine"
+        )
+        result = self._get_request_for_url(meals_url)
+        if not result.ok:
+            logger.warning("Failed to fetch meals: HTTP %s", result.status_code)
+            return []
+        return result.json()
 
     def get_meal(self, meal_id: int, meal_title: str) -> types.Recipe:
         """Returns meal details.
 
         See https://schema.org/Recipe for details regarding this schema.
+
+        Tries the Next.js __NEXT_DATA__ JSON first (current MFP), then falls
+        back to the legacy XPath scrape for older page structures.
         """
 
         meal_path = f"/meal/update_meal_ingredients/{meal_id}"
@@ -1418,28 +1427,52 @@ class Client(MFPBase):
         recipe_dict["name"] = meal_title
         recipe_dict["recipeYield"] = 1
         recipe_dict["recipeIngredient"] = []
+
+        # Try Next.js __NEXT_DATA__ embedded JSON first
+        next_data_nodes = document.xpath('//script[@id="__NEXT_DATA__"]/text()')
+        if next_data_nodes:
+            try:
+                next_data = json.loads(next_data_nodes[0])
+                page_props = (
+                    next_data.get("props", {}).get("pageProps", {})
+                )
+                # The meal ingredients live under pageProps.meal or similar;
+                # capture both the structured data and raw props for callers.
+                recipe_dict["_next_data"] = page_props
+                ingredients_raw = page_props.get("mealIngredients") or page_props.get(
+                    "ingredients"
+                ) or []
+                for item in ingredients_raw:
+                    name = item.get("food_name") or item.get("name") or str(item)
+                    recipe_dict["recipeIngredient"].append(name)
+                    if "food_id" in item:
+                        recipe_dict.setdefault("_food_ids", {})[name] = item["food_id"]
+                if recipe_dict["recipeIngredient"]:
+                    recipe_dict["recipeInstructions"] = ""
+                    recipe_dict["tags"] = ["MyFitnessPal"]
+                    return cast(types.Recipe, recipe_dict)
+            except Exception as exc:
+                logger.warning("Could not parse __NEXT_DATA__ for meal %s: %s", meal_id, exc)
+
+        # Legacy XPath scrape (Rails-era page)
         ingredients = document.xpath('//*[@id="meal-table"]/tbody/tr')
-        # No ingredients?
         if len(ingredients) == 1 and ingredients[0].xpath("./td[1]")[0].text == "\xa0":
             raise Exception("No ingredients found when fetching meal.")
-        else:
-            for ingredient in ingredients:
-                recipe_dict["recipeIngredient"].append(
-                    ingredient.xpath("./td[1]")[0].text
-                )
 
-            total = document.xpath('//*[@id="mealTableTotal"]/tbody/tr')[0]
-            recipe_dict["nutrition"] = {"@type": "NutritionInformation"}
-            recipe_dict["nutrition"]["calories"] = total.xpath("./td[2]")[0].text
-            recipe_dict["nutrition"]["carbohydrateContent"] = total.xpath("./td[3]")[
-                0
-            ].text
-            recipe_dict["nutrition"]["proteinContent"] = total.xpath("./td[5]")[0].text
-            recipe_dict["nutrition"]["fatContent"] = total.xpath("./td[4]")[0].text
-            recipe_dict["nutrition"]["sugarContent"] = total.xpath("./td[7]")[0].text
-            recipe_dict["nutrition"]["sodiumContent"] = total.xpath("./td[6]")[0].text
+        for ingredient in ingredients:
+            recipe_dict["recipeIngredient"].append(
+                ingredient.xpath("./td[1]")[0].text
+            )
 
-        # add some required tags to match schema
+        total = document.xpath('//*[@id="mealTableTotal"]/tbody/tr')[0]
+        recipe_dict["nutrition"] = {"@type": "NutritionInformation"}
+        recipe_dict["nutrition"]["calories"] = total.xpath("./td[2]")[0].text
+        recipe_dict["nutrition"]["carbohydrateContent"] = total.xpath("./td[3]")[0].text
+        recipe_dict["nutrition"]["proteinContent"] = total.xpath("./td[5]")[0].text
+        recipe_dict["nutrition"]["fatContent"] = total.xpath("./td[4]")[0].text
+        recipe_dict["nutrition"]["sugarContent"] = total.xpath("./td[7]")[0].text
+        recipe_dict["nutrition"]["sodiumContent"] = total.xpath("./td[6]")[0].text
+
         recipe_dict["recipeInstructions"] = ""
         recipe_dict["tags"] = ["MyFitnessPal"]
         return cast(types.Recipe, recipe_dict)
