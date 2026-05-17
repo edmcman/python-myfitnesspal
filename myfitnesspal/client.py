@@ -46,6 +46,13 @@ class Client(MFPBase):
     LOGIN_JSON_PATH = "api/auth/callback/credentials"
     CSRF_PATH = "api/auth/csrf"
     SEARCH_PATH = "food/search"
+    MEAL_MAP: dict[str, int] = {
+        "breakfast": 0,
+        "lunch": 1,
+        "dinner": 2,
+        "snacks": 3,
+        "snack": 3,
+    }
     ABBREVIATIONS = {
         "carbs": "carbohydrates",
     }
@@ -667,15 +674,9 @@ class Client(MFPBase):
         # the 'measurement' name to set the value.
         document = self._get_document_for_url(self._get_url_for_measurements())
 
-        # get authenticity token for this particular form.
-        authenticity_token = document.xpath(
-            "//form[@action='/measurements/new']/input[@name='authenticity_token']/@value"
-        )[0]
-
         # gather the IDs for all measurement types
         measurement_ids = self._get_measurement_ids(document)
 
-        # get the authenticity token for this edit
         authenticity_token = document.xpath(
             "(//form[@action='/measurements/new']/input[@name='authenticity_token']/@value)",
             smart_strings=False,
@@ -1600,7 +1601,7 @@ class Client(MFPBase):
         meal: str,
         date: datetime.date,
         quantity: float = 1.0,
-        weight_id: int | None = None,
+        weight_id: str | None = None,
     ) -> None:
         """Add a food item to the diary.
 
@@ -1611,17 +1612,10 @@ class Client(MFPBase):
             quantity: Number of servings (default 1.0)
             weight_id: Serving size ID. If None, uses the first serving from food details.
         """
-        meal_map = {
-            "breakfast": "0",
-            "lunch": "1",
-            "dinner": "2",
-            "snacks": "3",
-            "snack": "3",
-        }
-        meal_index = meal_map.get(meal.lower())
+        meal_index = self.MEAL_MAP.get(meal.lower())
         if meal_index is None:
             raise ValueError(
-                f"Invalid meal '{meal}'. Must be one of: {', '.join(meal_map)}"
+                f"Invalid meal '{meal}'. Must be one of: {', '.join(self.MEAL_MAP)}"
             )
 
         if weight_id is None:
@@ -1666,6 +1660,78 @@ class Client(MFPBase):
             raise MyfitnesspalRequestFailed(
                 f"Failed to add food to diary: status code {result.status_code}, "
                 f"response: {result.text[:200]}"
+            )
+        if result.status_code != 204:
+            raise MyfitnesspalRequestFailed(
+                f"Unexpected response adding food to diary: status code {result.status_code}, "
+                f"response: {result.text[:500]}"
+            )
+
+    def quick_add_to_diary(
+        self,
+        meal: str,
+        date: datetime.date,
+        calories: float,
+        protein: float = 0,
+        carbohydrates: float = 0,
+        fat: float = 0,
+    ) -> None:
+        """Quick-add calories and macros to a meal without specifying a food item.
+
+        Args:
+            meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
+            date: Date to add the entry
+            calories: Number of calories
+            protein: Grams of protein (default 0)
+            carbohydrates: Grams of carbohydrates (default 0)
+            fat: Grams of fat (default 0)
+        """
+        # Validate meal name; meal_name is passed as a string to the API
+        meal_lower = meal.lower()
+        if meal_lower not in self.MEAL_MAP:
+            raise ValueError(
+                f"Invalid meal '{meal}'. Must be one of: {', '.join(self.MEAL_MAP)}"
+            )
+        # API expects title-case meal name (e.g. "Lunch")
+        meal_name = meal.capitalize() if meal_lower != "snacks" else "Snacks"
+
+        # Get NextAuth CSRF token from /api/auth/csrf
+        csrf_url = parse.urljoin(self.BASE_URL_SECURE, self.CSRF_PATH)
+        csrf_resp = self.session.get(csrf_url)
+        if not csrf_resp.ok:
+            raise MyfitnesspalRequestFailed(
+                f"Could not fetch CSRF token: status {csrf_resp.status_code}"
+            )
+        csrf_token = csrf_resp.json().get("csrfToken", "")
+
+        diary_url = parse.urljoin(self.BASE_URL_SECURE, "api/services/diary")
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": self.BASE_URL_SECURE.rstrip("/"),
+            "Referer": f"{self.BASE_URL_SECURE.rstrip('/')}/food/quick-add?meal={self.MEAL_MAP[meal_lower]}",
+            "x-csrf-token": csrf_token,
+        }
+        payload = {
+            "items": [
+                {
+                    "meal_name": meal_name,
+                    "date": date.strftime("%Y-%m-%d"),
+                    "nutritional_contents": {
+                        "fat": fat,
+                        "carbohydrates": carbohydrates,
+                        "protein": protein,
+                        "energy": {"value": calories, "unit": "calories"},
+                    },
+                    "type": "quick_add",
+                }
+            ]
+        }
+        result = self.session.post(diary_url, json=payload, headers=headers)
+        if not result.ok:
+            raise MyfitnesspalRequestFailed(
+                f"Failed to quick-add to diary: status code {result.status_code}, "
+                f"response: {result.text[:500]}"
             )
 
     def load_meals(self, meal_index: int) -> list[dict[str, str]]:
@@ -1790,14 +1856,7 @@ class Client(MFPBase):
         """
         import lxml.html
 
-        meal_map = {
-            "breakfast": 0,
-            "lunch": 1,
-            "dinner": 2,
-            "snacks": 3,
-            "snack": 3,
-        }
-        meal_index = meal_map.get(diary_meal.lower(), 2)
+        meal_index = self.MEAL_MAP.get(diary_meal.lower(), 2)
         date_str = date.strftime("%Y-%m-%d")
 
         add_diary_url = parse.urljoin(
