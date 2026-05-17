@@ -769,6 +769,44 @@ class Client(MFPBase):
 
         return value
 
+    def set_water(self, date: datetime.date, milliliters: float) -> float:
+        """Set water intake for a date.
+
+        Returns the confirmed milliliter value from MFP.
+        """
+        search_url = parse.urljoin(self.BASE_URL_SECURE, self.SEARCH_PATH)
+        doc = self._get_document_for_url(search_url)
+        csrf_tokens = doc.xpath('//meta[@name="csrf-token"]/@content')
+        if not csrf_tokens:
+            raise MyfitnesspalRequestFailed(
+                "Could not find CSRF token on food search page"
+            )
+        csrf_token = csrf_tokens[0]
+
+        water_url = parse.urljoin(self.BASE_URL_SECURE, "food/water")
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "mfp-client-id": "mfp-main-js",
+            "mfp-user-id": str(self.user_id),
+            "Origin": self.BASE_URL_SECURE.rstrip("/"),
+            "Referer": search_url,
+            "X-CSRF-Token": csrf_token,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        post_data = {
+            "milliliters": str(milliliters),
+            "date": date.strftime("%Y-%m-%d"),
+        }
+        result = self.session.post(water_url, data=post_data, headers=headers)
+        if not result.ok:
+            raise MyfitnesspalRequestFailed(
+                f"Failed to set water: status code {result.status_code}, "
+                f"response: {result.text[:200]}"
+            )
+        return result.json()["item"]["milliliters"]
+
     def get_report(
         self,
         report_name: str = "Net Calories",
@@ -1449,3 +1487,403 @@ class Client(MFPBase):
             }
 
         return cast(types.Recipe, recipe_dict)
+
+    # ============================================================================
+    # Diary Write Operations
+    # ============================================================================
+
+    def delete_diary_entry(
+        self, meal: str, entry_index: int, date: datetime.date
+    ) -> tuple[str, str]:
+        """Delete a food entry from the diary by meal and index.
+
+        Returns:
+            (entry_id, entry_name)
+        """
+        import re
+
+        date_str = date.strftime("%Y-%m-%d")
+        diary_url = parse.urljoin(
+            self.BASE_URL_SECURE,
+            f"food/diary/{self.effective_username}?date={date_str}",
+        )
+        document = self._get_document_for_url(diary_url)
+
+        # Use the library's _get_meals to identify the entry by position
+        meals = self._get_meals(document)
+        target_meal = None
+        for m in meals:
+            if m.name.lower() == meal.lower():
+                target_meal = m
+                break
+
+        if target_meal is None:
+            available = ", ".join(m.name.title() for m in meals)
+            raise ValueError(f"Meal '{meal}' not found. Available: {available}")
+
+        if entry_index >= len(target_meal.entries):
+            raise ValueError(
+                f"Entry index {entry_index} out of range for {meal}. "
+                f"Found {len(target_meal.entries)} entries."
+            )
+
+        entry_name = target_meal.entries[entry_index].name
+
+        # Walk the HTML to find the delete link for this entry by position
+        headers = document.xpath("//tr[@class='meal_header']")
+        for header in headers:
+            tds = header.findall("td")
+            if not tds:
+                continue
+            meal_name = (tds[0].text or "").strip().lower()
+            if meal_name != meal.lower():
+                continue
+
+            idx = 0
+            current = header
+            while True:
+                current = current.getnext()
+                if current is None:
+                    break
+                if current.attrib.get("class") is not None:
+                    break
+                delete_link = current.xpath('.//td[@class="delete"]//a/@href')
+                if not delete_link:
+                    continue
+                if idx == entry_index:
+                    match = re.search(r"/food/remove/(\d+)", delete_link[0])
+                    if not match:
+                        raise MyfitnesspalRequestFailed(
+                            "Could not extract entry ID from delete link"
+                        )
+                    entry_id = match.group(1)
+
+                    # Extract CSRF token and DELETE the entry
+                    csrf_tokens = document.xpath(
+                        '//meta[@name="csrf-token"]/@content'
+                    )
+                    if not csrf_tokens:
+                        raise MyfitnesspalRequestFailed(
+                            "Could not find CSRF token on diary page"
+                        )
+                    csrf_token = csrf_tokens[0]
+
+                    remove_url = parse.urljoin(
+                        self.BASE_URL_SECURE, f"food/remove/{entry_id}"
+                    )
+                    result = self.session.delete(
+                        remove_url,
+                        headers={
+                            "Referer": diary_url,
+                            "X-CSRF-Token": csrf_token,
+                            "X-Requested-With": "XMLHttpRequest",
+                        },
+                    )
+                    if not result.ok:
+                        raise MyfitnesspalRequestFailed(
+                            f"Failed to delete entry: status code {result.status_code}"
+                        )
+
+                    return entry_id, entry_name
+                idx += 1
+
+            raise ValueError(
+                f"Entry index {entry_index} out of range for {meal} in HTML. "
+                f"Found {idx} entries."
+            )
+
+        raise ValueError(f"Meal '{meal}' not found in HTML.")
+
+    def add_food_to_diary(
+        self,
+        food_id: int,
+        meal: str,
+        date: datetime.date,
+        quantity: float = 1.0,
+        weight_id: int | None = None,
+    ) -> None:
+        """Add a food item to the diary.
+
+        Args:
+            food_id: MFP food item ID (from get_food_search_results or get_food_item_details)
+            meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
+            date: Date to add the entry
+            quantity: Number of servings (default 1.0)
+            weight_id: Serving size ID. If None, uses the first serving from food details.
+        """
+        meal_map = {
+            "breakfast": "0",
+            "lunch": "1",
+            "dinner": "2",
+            "snacks": "3",
+            "snack": "3",
+        }
+        meal_index = meal_map.get(meal.lower())
+        if meal_index is None:
+            raise ValueError(
+                f"Invalid meal '{meal}'. Must be one of: {', '.join(meal_map)}"
+            )
+
+        if weight_id is None:
+            food_item = self.get_food_item_details(food_id)
+            if not food_item.servings:
+                raise MyfitnesspalRequestFailed(
+                    f"No servings found for food ID {food_id}"
+                )
+            weight_id = food_item.servings[0].serving_id
+
+        search_url = parse.urljoin(self.BASE_URL_SECURE, self.SEARCH_PATH)
+        doc = self._get_document_for_url(search_url)
+        csrf_tokens = doc.xpath('//meta[@name="csrf-token"]/@content')
+        if not csrf_tokens:
+            raise MyfitnesspalRequestFailed(
+                "Could not find CSRF token on food search page"
+            )
+        csrf_token = csrf_tokens[0]
+
+        add_url = parse.urljoin(self.BASE_URL_SECURE, "food/add")
+        headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "mfp-client-id": "mfp-main-js",
+            "mfp-user-id": str(self.user_id),
+            "Origin": self.BASE_URL_SECURE.rstrip("/"),
+            "Referer": search_url,
+            "X-CSRF-Token": csrf_token,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        post_data = {
+            "food_entry[food_id]": str(food_id),
+            "food_entry[date]": date.strftime("%Y-%m-%d"),
+            "food_entry[quantity]": str(quantity),
+            "food_entry[weight_id]": str(weight_id),
+            "food_entry[meal_id]": meal_index,
+            "ajax": "true",
+        }
+        result = self.session.post(add_url, data=post_data, headers=headers)
+        if not result.ok:
+            raise MyfitnesspalRequestFailed(
+                f"Failed to add food to diary: status code {result.status_code}, "
+                f"response: {result.text[:200]}"
+            )
+
+    def load_meals(self, meal_index: int) -> list[dict[str, str]]:
+        """Fetch all saved meals from /food/load_meals, paginating through results.
+
+        Uses the existing session (which must have valid cookies). Visits
+        add_to_diary first to establish pagination state, then paginates
+        through load_meals.
+
+        Returns a list of dicts with keys: food_id, weight_id, name.
+        """
+        import lxml.html
+
+        date_str = datetime.datetime.now().date().strftime("%Y-%m-%d")
+        add_diary_url = parse.urljoin(
+            self.BASE_URL_SECURE,
+            f"food/add_to_diary?meal={meal_index}&date={date_str}",
+        )
+        url = parse.urljoin(self.BASE_URL_SECURE, "food/load_meals")
+
+        # Step 1: Visit add_to_diary to establish pagination state
+        resp = self.session.get(add_diary_url)
+        add_diary_doc = lxml.html.document_fromstring(resp.text)
+        csrf_tokens = add_diary_doc.xpath('//meta[@name="csrf-token"]/@content')
+        csrf_token = csrf_tokens[0] if csrf_tokens else ""
+
+        all_meals: list[dict[str, str]] = []
+        seen_food_ids: set[str] = set()
+        base_index = 0
+
+        while True:
+            resp = self.session.post(
+                url,
+                data={
+                    "meal": str(meal_index),
+                    "base_index": str(base_index),
+                    "page": "1",
+                },
+                headers={
+                    "Accept": "text/html, */*; q=0.01",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "X-CSRF-Token": csrf_token,
+                    "Origin": self.BASE_URL_SECURE,
+                    "Referer": add_diary_url,
+                },
+            )
+
+            if not resp.ok:
+                logger.warning(
+                    "load_meals base_index=%s returned HTTP %s",
+                    base_index,
+                    resp.status_code,
+                )
+                break
+
+            doc = lxml.html.document_fromstring(resp.text)
+            page_meals: list[dict[str, str]] = []
+
+            for row in doc.xpath('//tr[contains(@class,"favorite")]'):
+                hidden = row.xpath(
+                    './/input[@type="hidden"][contains(@name,"food_id")]'
+                )
+                if not hidden:
+                    continue
+                food_id = hidden[0].get("value", "")
+                name_td = row.xpath(".//td[2]")
+                name = name_td[0].text_content().strip() if name_td else ""
+
+                weight_id = ""
+                weight_sel = row.xpath('.//select[contains(@name,"weight_id")]')
+                if weight_sel:
+                    selected = weight_sel[0].xpath(".//option[@selected]/@value")
+                    if selected:
+                        weight_id = selected[0]
+                    else:
+                        first = weight_sel[0].xpath(".//option[1]/@value")
+                        if first:
+                            weight_id = first[0]
+
+                if food_id and name:
+                    page_meals.append(
+                        {
+                            "food_id": food_id,
+                            "weight_id": weight_id,
+                            "name": name,
+                        }
+                    )
+
+            new_meals = [m for m in page_meals if m["food_id"] not in seen_food_ids]
+            if not new_meals:
+                break
+
+            for m in new_meals:
+                seen_food_ids.add(m["food_id"])
+                all_meals.append(m)
+
+            if len(page_meals) < 25:
+                break
+
+            base_index += len(page_meals)
+
+        return all_meals
+
+    def log_saved_meal(
+        self, meal_name: str, diary_meal: str, date: datetime.date
+    ) -> dict[str, str]:
+        """Log a saved meal to the food diary via the add_favorites endpoint.
+
+        Returns:
+            Dict with keys: food_id, weight_id, name.
+        """
+        import lxml.html
+
+        meal_map = {
+            "breakfast": 0,
+            "lunch": 1,
+            "dinner": 2,
+            "snacks": 3,
+            "snack": 3,
+        }
+        meal_index = meal_map.get(diary_meal.lower(), 2)
+        date_str = date.strftime("%Y-%m-%d")
+
+        add_diary_url = parse.urljoin(
+            self.BASE_URL_SECURE,
+            f"food/add_to_diary?meal={meal_index}&date={date_str}",
+        )
+        resp = self.session.get(add_diary_url)
+        doc = lxml.html.document_fromstring(resp.text)
+
+        # Extract authenticity token from the add_favorites form
+        form = doc.xpath("//form[contains(@action, 'add_favorites')][1]")
+        if not form:
+            raise MyfitnesspalRequestFailed(
+                "Could not find add_favorites form on add_to_diary page"
+            )
+
+        at = form[0].xpath(".//input[@name='authenticity_token']/@value")
+        if not at:
+            raise MyfitnesspalRequestFailed(
+                "Could not find authenticity_token on add_to_diary page"
+            )
+        authenticity_token = at[0]
+
+        # Search for the meal by name in the form
+        meal_entry = None
+        for row in form[0].xpath('.//tr[contains(@class,"favorite")]'):
+            cb = row.xpath('.//input[@type="checkbox"]')
+            if not cb:
+                continue
+            idx = (
+                cb[0]
+                .get("name", "")
+                .replace("favorites[", "")
+                .replace("][checked]", "")
+            )
+            hidden = row.xpath(
+                f'.//input[@type="hidden"][contains(@name,"favorites[{idx}][food_id]")]'
+            )
+            if not hidden:
+                continue
+            food_id = hidden[0].get("value", "")
+            name_td = row.xpath(".//td[2]")
+            name = name_td[0].text_content().strip() if name_td else ""
+
+            weight_id = ""
+            weight_sel = row.xpath(f'.//select[@name="favorites[{idx}][weight_id]"]')
+            if weight_sel:
+                selected = weight_sel[0].xpath('.//option[@selected]/@value')
+                weight_id = selected[0] if selected else ""
+
+            if meal_name.lower() in name.lower() or name.lower() in meal_name.lower():
+                meal_entry = {
+                    "food_id": food_id,
+                    "weight_id": weight_id,
+                    "name": name,
+                    "index": idx,
+                }
+                break
+
+        if meal_entry is None:
+            available_names = []
+            for row in form[0].xpath('.//tr[contains(@class,"favorite")]')[:10]:
+                name_td = row.xpath(".//td[2]")
+                if name_td:
+                    available_names.append(name_td[0].text_content().strip())
+            available = ", ".join(available_names)
+            raise ValueError(
+                f"Meal '{meal_name}' not found. "
+                f"Available meals: {available}"
+            )
+
+        add_url = parse.urljoin(self.BASE_URL_SECURE, "food/add_favorites")
+        post_data = {
+            "authenticity_token": authenticity_token,
+            "meal": str(meal_index),
+            "date": date_str,
+            f"favorites[{meal_entry['index']}][food_id]": meal_entry["food_id"],
+            f"favorites[{meal_entry['index']}][checked]": "1",
+            f"favorites[{meal_entry['index']}][quantity]": "1",
+            f"favorites[{meal_entry['index']}][weight_id]": meal_entry["weight_id"],
+            "add": "Add Checked",
+        }
+
+        result = self.session.post(
+            add_url,
+            data=post_data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": add_diary_url,
+                "Origin": self.BASE_URL_SECURE,
+            },
+        )
+
+        if not result.ok:
+            raise MyfitnesspalRequestFailed(
+                f"add_favorites returned HTTP {result.status_code}"
+            )
+
+        return meal_entry
