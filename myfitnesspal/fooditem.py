@@ -26,6 +26,7 @@ class FoodItem(MFPBase):
         confirmations: Optional[int] = None,
         serving_sizes: Optional[List[types.ServingSizeDict]] = None,
         client: Optional["Client"] = None,
+        old_weight_ids: Optional[List[str]] = None,
     ):
         self._mfp_id = mfp_id
         self._name = name
@@ -37,6 +38,7 @@ class FoodItem(MFPBase):
         self._confirmations = confirmations
         self._serving_sizes = serving_sizes
         self._client = client
+        self.old_weight_ids: List[str] = old_weight_ids or []
 
     def _load_nutrition_details(self):
         if self._details:
@@ -81,9 +83,13 @@ class FoodItem(MFPBase):
     @property
     def serving(self) -> Optional[str]:
         """Serving"""
-        self._load_nutrition_details()
+        try:
+            self._load_nutrition_details()
+        except Exception:
+            return None
 
-        assert self._serving_sizes is not None
+        if self._serving_sizes is None:
+            return None
 
         for s in self._serving_sizes:
             if s["index"] == 0:

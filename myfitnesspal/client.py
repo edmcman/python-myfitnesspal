@@ -921,7 +921,12 @@ class Client(MFPBase):
         for item_div in item_divs:
             # get mfp info from search results
             a = item_div.xpath(".//div[@class='search-title-container']/a")[0]
-            mfp_id = int(a.get("data-external-id"))
+            # Prefer the old-format ID (data-original-id) which works with /food/add;
+            # fall back to data-external-id for foods that only exist in the new system.
+            original_id_str = a.get("data-original-id")
+            mfp_id = int(original_id_str) if original_id_str else int(a.get("data-external-id"))
+            weight_ids_str = a.get("data-weight-ids", "")
+            old_weight_ids = [w for w in weight_ids_str.split(",") if w]
             mfp_name = a.text
             verif = (
                 True
@@ -937,7 +942,8 @@ class Client(MFPBase):
                     brand = " ".join(nutr_info[0:-2]).strip()
                 calories = float(nutr_info[-1].replace("calories", "").strip())
             items.append(
-                FoodItem(mfp_id, mfp_name, brand, verif, calories, client=self)
+                FoodItem(mfp_id, mfp_name, brand, verif, calories, client=self,
+                         old_weight_ids=old_weight_ids)
             )
 
         return items
@@ -1617,14 +1623,6 @@ class Client(MFPBase):
             raise ValueError(
                 f"Invalid meal '{meal}'. Must be one of: {', '.join(self.MEAL_MAP)}"
             )
-
-        if weight_id is None:
-            food_item = self.get_food_item_details(food_id)
-            if not food_item.servings:
-                raise MyfitnesspalRequestFailed(
-                    f"No servings found for food ID {food_id}"
-                )
-            weight_id = food_item.servings[0].serving_id
 
         search_url = parse.urljoin(self.BASE_URL_SECURE, self.SEARCH_PATH)
         doc = self._get_document_for_url(search_url)
