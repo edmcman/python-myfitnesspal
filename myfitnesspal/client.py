@@ -1751,22 +1751,22 @@ class Client(MFPBase):
                 f"response: {result.text[:500]}"
             )
 
-    def load_meals(self, meal_index: int) -> list[dict[str, str]]:
-        """Fetch all saved meals from /food/load_meals, paginating through results.
+    def _load_food_tab(
+        self, endpoint_path: str, meal_index: int = 0
+    ) -> list[dict[str, str]]:
+        """Paginate a food-tab endpoint (load_meals, load_recent, load_my_foods, load_most_used).
 
-        Visits /user/{username}/diary/add first to establish pagination state,
-        then paginates through load_meals to return saved meal groups.
+        GETs the add_to_diary page to prime CSRF, then POSTs to endpoint_path
+        with meal/base_index/page params until all rows are returned.
 
         Returns a list of dicts with keys: food_id, weight_id, name, index.
         """
-        import lxml.html
-
         date_str = datetime.datetime.now().date().strftime("%Y-%m-%d")
         add_diary_url = parse.urljoin(
             self.BASE_URL_SECURE,
             f"food/add_to_diary?meal={meal_index}&date={date_str}",
         )
-        load_meals_url = parse.urljoin(self.BASE_URL_SECURE, "food/load_meals")
+        tab_url = parse.urljoin(self.BASE_URL_SECURE, endpoint_path)
 
         resp = self.session.get(add_diary_url)
         add_diary_doc = lxml.html.document_fromstring(resp.text)
@@ -1780,7 +1780,7 @@ class Client(MFPBase):
 
         while True:
             resp = self.session.post(
-                load_meals_url,
+                tab_url,
                 data={
                     "meal": str(meal_index),
                     "base_index": str(base_index),
@@ -1798,7 +1798,8 @@ class Client(MFPBase):
 
             if not resp.ok:
                 logger.warning(
-                    "load_meals base_index=%s returned HTTP %s",
+                    "%s base_index=%s returned HTTP %s",
+                    endpoint_path,
                     base_index,
                     resp.status_code,
                 )
@@ -1862,6 +1863,35 @@ class Client(MFPBase):
             page += 1
 
         return all_meals
+
+    def load_meals(self, meal_index: int) -> list[dict[str, str]]:
+        """Fetch all saved meals from /food/load_meals, paginating through results.
+
+        Returns a list of dicts with keys: food_id, weight_id, name, index.
+        """
+        return self._load_food_tab("food/load_meals", meal_index)
+
+    def load_recent_foods(self, meal_index: int = 0) -> list[dict[str, str]]:
+        """Fetch recently logged foods from /food/load_recent.
+
+        Returns a list of dicts with keys: food_id, weight_id, name, index.
+        """
+        return self._load_food_tab("food/load_recent", meal_index)
+
+    def load_frequent_foods(self, meal_index: int = 0) -> list[dict[str, str]]:
+        """Fetch frequently logged foods from /food/load_most_used.
+
+        Returns a list of dicts with keys: food_id, weight_id, name, index.
+        Note: MFP's "Frequent" tab maps to the load_most_used endpoint.
+        """
+        return self._load_food_tab("food/load_most_used", meal_index)
+
+    def load_my_foods(self, meal_index: int = 0) -> list[dict[str, str]]:
+        """Fetch user-created custom foods from /food/load_my_foods.
+
+        Returns a list of dicts with keys: food_id, weight_id, name, index.
+        """
+        return self._load_food_tab("food/load_my_foods", meal_index)
 
     def log_saved_meal(
         self, meal_name: str, diary_meal: str, date: datetime.date
