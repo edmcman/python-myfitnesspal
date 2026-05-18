@@ -1624,6 +1624,21 @@ class Client(MFPBase):
                 f"Invalid meal '{meal}'. Must be one of: {', '.join(self.MEAL_MAP)}"
             )
 
+        # /food/add only accepts old-format (~10-digit) IDs. New-format (15-digit)
+        # IDs come from the mobile v2 API and are silently ignored by this endpoint.
+        # Use mfp_search_food to get old-format mfp_id and weight_ids.
+        NEW_ID_THRESHOLD = 10 ** 11
+        if food_id > NEW_ID_THRESHOLD:
+            raise ValueError(
+                f"food_id {food_id} is a new-format ID (>10^11) that /food/add does not support. "
+                "Use mfp_search_food to get an old-format mfp_id and pass its weight_ids[0] as weight_id."
+            )
+        if weight_id and int(weight_id) > NEW_ID_THRESHOLD:
+            raise ValueError(
+                f"weight_id {weight_id} is a new-format ID (>10^11) that /food/add does not support. "
+                "Use the weight_ids list from mfp_search_food results instead."
+            )
+
         search_url = parse.urljoin(self.BASE_URL_SECURE, self.SEARCH_PATH)
         doc = self._get_document_for_url(search_url)
         csrf_tokens = doc.xpath('//meta[@name="csrf-token"]/@content')
