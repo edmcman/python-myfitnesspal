@@ -924,7 +924,9 @@ class Client(MFPBase):
             # Prefer the old-format ID (data-original-id) which works with /food/add;
             # fall back to data-external-id for foods that only exist in the new system.
             original_id_str = a.get("data-original-id")
-            mfp_id = int(original_id_str) if original_id_str else int(a.get("data-external-id"))
+            external_id_str = a.get("data-external-id")
+            mfp_id = int(original_id_str) if original_id_str else int(external_id_str)
+            external_id = int(external_id_str) if external_id_str else None
             weight_ids_str = a.get("data-weight-ids", "")
             old_weight_ids = [w for w in weight_ids_str.split(",") if w]
             mfp_name = a.text
@@ -943,7 +945,7 @@ class Client(MFPBase):
                 calories = float(nutr_info[-1].replace("calories", "").strip())
             items.append(
                 FoodItem(mfp_id, mfp_name, brand, verif, calories, client=self,
-                         old_weight_ids=old_weight_ids)
+                         old_weight_ids=old_weight_ids, external_id=external_id)
             )
 
         return items
@@ -969,7 +971,9 @@ class Client(MFPBase):
         )
         result = self._get_request_for_url(metadata_url, send_token=True)
         if not result.ok:
-            raise MyfitnesspalRequestFailed()
+            raise MyfitnesspalRequestFailed(
+                f"v2 food API returned {result.status_code} for food ID {mfp_id}"
+            )
 
         resp = result.json()["item"]
 

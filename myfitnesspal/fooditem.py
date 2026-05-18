@@ -27,6 +27,7 @@ class FoodItem(MFPBase):
         serving_sizes: Optional[List[types.ServingSizeDict]] = None,
         client: Optional["Client"] = None,
         old_weight_ids: Optional[List[str]] = None,
+        external_id: Optional[int] = None,
     ):
         self._mfp_id = mfp_id
         self._name = name
@@ -39,6 +40,7 @@ class FoodItem(MFPBase):
         self._serving_sizes = serving_sizes
         self._client = client
         self.old_weight_ids: List[str] = old_weight_ids or []
+        self.external_id: Optional[int] = external_id
 
     def _load_nutrition_details(self):
         if self._details:
@@ -46,7 +48,9 @@ class FoodItem(MFPBase):
 
         assert self._client
 
-        details = self._client._get_food_item_details(self.mfp_id)
+        # v2 API only accepts new-format (external) IDs; prefer external_id over mfp_id
+        lookup_id = self.external_id if self.external_id is not None else self.mfp_id
+        details = self._client._get_food_item_details(lookup_id)
 
         self._details = details["nutrition"]
         self._confirmations = details["confirmations"]
